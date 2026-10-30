@@ -1,0 +1,7 @@
+# Build output, generated and static assets
+.next/
+out/
+build/
+next-env.d.ts
+public/
+package-lock.json

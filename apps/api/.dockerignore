@@ -1,0 +1,19 @@
+node_modules
+dist
+coverage
+.env
+.env.*
+*.log
+boot.log
+boot.err
+run.log
+run.err
+*.pid
+.run-*.pid
+.git
+.gitignore
+Dockerfile
+.dockerignore
+README.md
+# Readiness contract tests run inside the build stage.
+*.tsbuildinfo

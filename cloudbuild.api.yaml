@@ -1,0 +1,152 @@
+# Cloud Build pipeline — API (NestJS) → Cloud Run service `simify-api`.
+# Triggered on pushes touching apps/api/**. Builds the image, runs Prisma
+# migrations against Cloud SQL (one-off job), then deploys.
+#
+# CELITECH preview is opt-in after its two secrets exist. Real sales remain OFF
+# until live Paystack keys and the launch acceptance checks are explicitly approved.
+# PAYSTACK_MODE=live means the real API transport; sk_test_ still means TEST money.
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: global-simify-repo
+  _SERVICE: simify-api
+  _JOB: simify-migrate
+  _INSTANCE: simify-postgres-db
+  _WEB_ORIGIN: https://globalsimify.com
+  _ADMIN_EMAILS: admin@example.com
+  _API_BASE_URL: https://api.globalsimify.com
+  _CELITECH_MODE: live
+  _CELITECH_WEBHOOKS: 'false'
+  # Owner authorized public customer checkout after the pilot (2026-09-17).
+  _LIVE_SALES_ENABLED: 'true'
+  _LIVE_SALES_ADMIN_ONLY: 'false'
+  # Pin versions: key rotation must not change the environment of an old revision.
+  _PAYSTACK_SECRET_VERSION: '2'
+  _PAYSTACK_PUBLIC_VERSION: '1'
+  _BACKGROUND_MODE: cloud-tasks
+  _WORKER_SERVICE: simify-worker
+  _TASKS_QUEUE: simify-background
+  _ASSISTANT_ENABLED: 'true'
+  _OPENAI_SECRET_VERSION: '1'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # 1. Build the API image (context = apps/api).
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - apps/api/Dockerfile
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - apps/api
+
+  # 2. Push both tags.
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+  # 3. Run DB migrations as a one-off Cloud Run job (create on first run, then update).
+  - id: migrate
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        IMG=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+        if gcloud run jobs describe ${_JOB} --region=${_REGION} >/dev/null 2>&1; then
+          gcloud run jobs update ${_JOB} --image=$$IMG --region=${_REGION}
+        else
+          gcloud run jobs create ${_JOB} --image=$$IMG --region=${_REGION} \
+            --set-cloudsql-instances=$PROJECT_ID:${_REGION}:${_INSTANCE} \
+            --set-secrets=DATABASE_URL=DATABASE_URL:latest \
+            --command=npx --args=prisma,migrate,deploy
+        fi
+        gcloud run jobs execute ${_JOB} --region=${_REGION} --wait
+
+  # 4. Deploy the new image to Cloud Run.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -euo pipefail
+        EXTRA=()
+        [[ "${_PAYSTACK_SECRET_VERSION}" =~ ^[1-9][0-9]*$ ]] || { echo 'A numeric Paystack secret version is required.'; exit 1; }
+        SECRETS="DATABASE_URL=DATABASE_URL:latest,JWT_ACCESS_SECRET=JWT_ACCESS_SECRET:latest,JWT_REFRESH_SECRET=JWT_REFRESH_SECRET:latest,SMTP_PASS=SMTP_PASS:latest,PAYSTACK_SECRET_KEY=PAYSTACK_SECRET_KEY:${_PAYSTACK_SECRET_VERSION}"
+        if [ -n "${_PAYSTACK_PUBLIC_VERSION}" ]; then
+          [[ "${_PAYSTACK_PUBLIC_VERSION}" =~ ^[1-9][0-9]*$ ]] || { echo 'A numeric Paystack public-key version is required.'; exit 1; }
+          SECRETS="$$SECRETS,PAYSTACK_PUBLIC_KEY=PAYSTACK_PUBLIC_KEY:${_PAYSTACK_PUBLIC_VERSION}"
+        elif [ "${_LIVE_SALES_ENABLED}" = "true" ]; then
+          echo 'Live sales require both pinned Paystack key versions.'; exit 1
+        fi
+        if [ "${_CELITECH_MODE}" = "live" ]; then
+          SECRETS="$$SECRETS,CELITECH_CLIENT_ID=CELITECH_CLIENT_ID:latest,CELITECH_CLIENT_SECRET=CELITECH_CLIENT_SECRET:latest"
+        fi
+        if [ "${_CELITECH_WEBHOOKS}" = "true" ]; then
+          SECRETS="$$SECRETS,CELITECH_WEBHOOK_SECRET=CELITECH_WEBHOOK_SECRET:latest"
+        fi
+        WORKER_URL="https://${_WORKER_SERVICE}-${PROJECT_NUMBER}.${_REGION}.run.app"
+        # Keep the existing OIDC audience stable during rolling worker updates.
+        if EXISTING_WORKER_URL=$$(gcloud run services describe ${_WORKER_SERVICE} --region=${_REGION} --project=$PROJECT_ID --format='value(status.url)' 2>/dev/null); then
+          WORKER_URL="$$EXISTING_WORKER_URL"
+        fi
+        BACKGROUND="BACKGROUND_MODE=${_BACKGROUND_MODE},BACKGROUND_ROLE=api,TASKS_QUEUE_PATH=projects/$PROJECT_ID/locations/${_REGION}/queues/${_TASKS_QUEUE},WORKER_URL=$$WORKER_URL,TASKS_INVOKER_EMAIL=simify-task-invoker@$PROJECT_ID.iam.gserviceaccount.com"
+        COMMON_ENV="NODE_ENV=production,PAYSTACK_MODE=live,CELITECH_MODE=${_CELITECH_MODE},CELITECH_ENVIRONMENT=PRODUCTION,LIVE_SALES_ENABLED=${_LIVE_SALES_ENABLED},LIVE_SALES_ADMIN_ONLY=${_LIVE_SALES_ADMIN_ONLY},EMAIL_PROVIDER=smtp,SMTP_HOST=smtp.resend.com,SMTP_PORT=587,SMTP_USER=resend,ADMIN_EMAILS=${_ADMIN_EMAILS},CORS_ORIGINS=${_WEB_ORIGIN},API_BASE_URL=${_API_BASE_URL}"
+        if [ "${_BACKGROUND_MODE}" = "cloud-tasks" ]; then
+          WORKER_BACKGROUND=$${BACKGROUND/BACKGROUND_ROLE=api/BACKGROUND_ROLE=worker}
+          # Private service is the IAM boundary for /internal/work; never grant public invocation.
+          gcloud run deploy ${_WORKER_SERVICE} \
+            --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA \
+            --region=${_REGION} --project=$PROJECT_ID --platform=managed \
+            --no-allow-unauthenticated --min-instances=0 --max-instances=2 --cpu-throttling \
+            --cpu=1 --memory=512Mi --concurrency=4 --timeout=600 \
+            --startup-probe=httpGet.path=/api/v1/health/ready,httpGet.port=8080,periodSeconds=5,timeoutSeconds=3,failureThreshold=48 \
+            --service-account=${PROJECT_NUMBER}-compute@developer.gserviceaccount.com \
+            --add-cloudsql-instances=$PROJECT_ID:${_REGION}:${_INSTANCE} \
+            --update-env-vars="$$COMMON_ENV,$$WORKER_BACKGROUND,ASSISTANT_ENABLED=false" \
+            --update-secrets="$$SECRETS"
+          WORKER_URL=$$(gcloud run services describe ${_WORKER_SERVICE} --region=${_REGION} --project=$PROJECT_ID --format='value(status.url)')
+          gcloud run services update ${_WORKER_SERVICE} --region=${_REGION} --project=$PROJECT_ID \
+            --update-env-vars="BACKGROUND_ROLE=worker,WORKER_URL=$$WORKER_URL"
+          gcloud run services add-iam-policy-binding ${_WORKER_SERVICE} --region=${_REGION} --project=$PROJECT_ID \
+            --member="serviceAccount:simify-task-invoker@$PROJECT_ID.iam.gserviceaccount.com" --role=roles/run.invoker
+          gcloud run services get-iam-policy ${_WORKER_SERVICE} --region=${_REGION} --project=$PROJECT_ID --format=json > /tmp/worker-iam.json
+          python3 -c 'import json; p=json.load(open("/tmp/worker-iam.json")); assert not any(m in ("allUsers","allAuthenticatedUsers") for b in p.get("bindings",[]) for m in b.get("members",[])), "Worker must be private"'
+          BACKGROUND="BACKGROUND_MODE=cloud-tasks,BACKGROUND_ROLE=api,TASKS_QUEUE_PATH=projects/$PROJECT_ID/locations/${_REGION}/queues/${_TASKS_QUEUE},WORKER_URL=$$WORKER_URL,TASKS_INVOKER_EMAIL=simify-task-invoker@$PROJECT_ID.iam.gserviceaccount.com"
+          EXTRA+=(--min-instances=0 --cpu-throttling)
+        elif [ "${_LIVE_SALES_ENABLED}" = "true" ]; then
+          # Recovery, email retries and usage workers must run between requests.
+          # Instance-based billing increases baseline cost; approve before launch.
+          EXTRA+=(--min-instances=1 --no-cpu-throttling)
+        else
+          EXTRA+=(--min-instances=0 --cpu-throttling)
+        fi
+        if [ "${_ASSISTANT_ENABLED}" = "true" ]; then
+          [[ "${_OPENAI_SECRET_VERSION}" =~ ^[1-9][0-9]*$ ]] || { echo 'Pin an OpenAI key version before enabling chat.'; exit 1; }
+          SECRETS="$$SECRETS,OPENAI_API_KEY=OPENAI_API_KEY:${_OPENAI_SECRET_VERSION}"
+        fi
+        gcloud run deploy ${_SERVICE} \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA \
+          --region=${_REGION} --project=$PROJECT_ID --platform=managed \
+          --allow-unauthenticated --max-instances=3 \
+          --startup-probe=httpGet.path=/api/v1/health/ready,httpGet.port=8080,periodSeconds=5,timeoutSeconds=3,failureThreshold=48 \
+          --service-account=${PROJECT_NUMBER}-compute@developer.gserviceaccount.com \
+          --add-cloudsql-instances=$PROJECT_ID:${_REGION}:${_INSTANCE} \
+          --remove-env-vars=PAYSTACK_PUBLIC_KEY \
+          --update-env-vars="$$COMMON_ENV,$$BACKGROUND,ASSISTANT_ENABLED=${_ASSISTANT_ENABLED},ASSISTANT_MODEL=gpt-5-mini" \
+          --update-secrets="$$SECRETS" "$${EXTRA[@]}"
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest

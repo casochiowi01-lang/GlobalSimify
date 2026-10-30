@@ -1,0 +1,41 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+
+# Build output
+dist/
+.next/
+out/
+build/
+coverage/
+
+# Prisma
+apps/api/prisma/migrations/dev.db*
+
+# Logs & temp run files
+*.log
+npm-debug.log*
+boot.log
+boot.err
+run.log
+run.err
+*.pid
+.run-*.pid
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Misc
+*.tsbuildinfo
+.cache/

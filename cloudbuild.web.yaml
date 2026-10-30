@@ -1,0 +1,98 @@
+# Cloud Build pipeline — web (Next.js) → Cloud Run service `simify-web-app`.
+# Triggered on pushes touching apps/web/**. Builds the image and deploys.
+#
+# IMPORTANT: NEXT_PUBLIC_* are baked in at BUILD time, and the home page is
+# server-rendered — so the API at _API_BASE_URL MUST be live and reachable when
+# this builds. Set _API_BASE_URL to the API's reachable URL (its Cloud Run
+# *.run.app URL initially, or https://api.globalsimify.com once that's mapped).
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: global-simify-repo
+  _SERVICE: simify-web-app
+  _API_BASE_URL: https://api.globalsimify.com
+  _WHATSAPP: '254710204662'
+  _SITE_URL: https://globalsimify.com
+  # Analytics — set ONE of these to turn analytics on (empty = off):
+  #   _PLAUSIBLE_DOMAIN: globalsimify.com   (privacy-friendly)
+  #   _GA_ID: G-XXXXXXXXXX                  (Google Analytics 4)
+  _PLAUSIBLE_DOMAIN: ''
+  _GA_ID: 'G-HE8G9ZDKHR'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+steps:
+  # A new checkout must never be published against the old order/quote contract.
+  - id: wait-for-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: python3
+    args:
+      - -c
+      - |
+        import json, time, urllib.request
+        for attempt in range(90):
+          try:
+            with urllib.request.urlopen('https://api.globalsimify.com/api/v1/health/ready', timeout=15) as response:
+              health = json.load(response)
+            if health.get('status') == 'ok' and health.get('checkoutVersion', 0) >= 3 and health.get('assistantVersion', 0) >= 1 and health.get('deliveryVersion', 0) >= 1:
+              print('Compatible API and catalogue ready.')
+              break
+          except Exception:
+            pass
+          if attempt % 6 == 0:
+            print('Waiting for compatible API and catalogue...', flush=True)
+          time.sleep(10)
+        else:
+          raise SystemExit('API not ready; web deployment was not attempted.')
+
+  # 1. Build the web image (context = apps/web), baking in the public config.
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - apps/web/Dockerfile
+      - --build-arg
+      # Hardcoded (NOT ${_API_BASE_URL}) so a trigger-level substitution
+      # override can't point the web app back at the *.run.app host. The API
+      # MUST be same-site (api.globalsimify.com) for the session cookie to work.
+      - NEXT_PUBLIC_API_BASE_URL=https://api.globalsimify.com/api/v1
+      - --build-arg
+      - NEXT_PUBLIC_WHATSAPP_NUMBER=${_WHATSAPP}
+      - --build-arg
+      - NEXT_PUBLIC_SITE_URL=${_SITE_URL}
+      - --build-arg
+      - NEXT_PUBLIC_PLAUSIBLE_DOMAIN=${_PLAUSIBLE_DOMAIN}
+      - --build-arg
+      - NEXT_PUBLIC_GA_ID=${_GA_ID}
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest
+      - apps/web
+
+  # 2. Push both tags.
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}
+
+  # 3. Deploy (replaces the temporary hello-world revision; domain mapping stays).
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_SERVICE}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_SERVICE}:latest

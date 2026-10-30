@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    name: API (lint, types, tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Unit tests
+        run: npm test -- --runInBand
+      - name: Contract and order-lifecycle tests
+        run: npm run test:contracts
+
+  api-database:
+    name: API (PostgreSQL integration)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: ci
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: rollout
+        ports:
+          - 54339:5432
+        options: >-
+          --health-cmd "pg_isready -U ci -d rollout"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The integration test refuses any other host, port or database name.
+      READINESS_DATABASE_URL: postgresql://ci:ci@127.0.0.1:54339/rollout
+      DATABASE_URL: postgresql://ci:ci@127.0.0.1:54339/rollout
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+      - run: npm ci
+      - run: npx prisma generate
+      - name: Apply all migrations to an empty database
+        run: npx prisma migrate deploy
+      - name: Fail if migrations and schema.prisma have drifted
+        run: >-
+          npx prisma migrate diff
+          --from-migrations prisma/migrations
+          --to-schema-datamodel prisma/schema.prisma
+          --shadow-database-url postgresql://ci:ci@127.0.0.1:54339/postgres
+          --exit-code
+      - run: npm run build
+      - name: Concurrent provisioning against a real database
+        run: node --require ./test/setup.cjs --test test/fulfilment-db.test.cjs
+
+  web:
+    name: Web (lint, types, unit tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+      - run: npm run format:check
+      - run: npm run lint
+      - run: npm run typecheck
+      - name: Unit tests
+        run: npm test

@@ -1,0 +1,538 @@
+// GlobalSimify database schema. State machines and money flows are described
+// in docs/ARCHITECTURE.md.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog (Phase 1)
+// ---------------------------------------------------------------------------
+
+model Country {
+  iso         String    @id @db.VarChar(2) // ISO-3166 alpha-2
+  name        String
+  region      String?
+  flagEmoji   String?
+  seoSlug     String    @unique
+  popularRank Int? // lower = more prominent on the storefront
+  products    Product[]
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([region])
+  @@map("countries")
+}
+
+enum ProductType {
+  COUNTRY
+  REGION
+  GLOBAL
+}
+
+model Product {
+  id              String         @id @default(cuid())
+  // The orderable eSIM Go bundle id, e.g. "esim_5GB_30D_AE_V2".
+  esimgoBundle    String         @unique
+  type            ProductType    @default(COUNTRY)
+  countryIso      String?        @db.VarChar(2)
+  country         Country?       @relation(fields: [countryIso], references: [iso])
+  region          String?
+  title           String
+  dataMb          Int // data allowance in MB (0 when unlimited)
+  unlimited       Boolean        @default(false)
+  validityDays    Int
+  baseUsd         Decimal        @db.Decimal(10, 4) // wholesale cost from eSIM Go
+  isActive        Boolean        @default(true)
+  coverageCount   Int            @default(1)
+  prices          ProductPrice[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([type, countryIso])
+  @@index([isActive])
+  @@map("products")
+}
+
+// A snapshot of the computed retail price at sync time. Orders snapshot the
+// price they were sold at separately, so later re-pricing never mutates an
+// existing order.
+model ProductPrice {
+  id          String   @id @default(cuid())
+  productId   String
+  product     Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  baseUsd     Decimal  @db.Decimal(10, 4)
+  fxRate      Decimal  @db.Decimal(12, 6)
+  fxBufferPct Decimal  @db.Decimal(6, 4)
+  feePct      Decimal  @db.Decimal(6, 4)
+  marginPct   Decimal  @db.Decimal(6, 4)
+  retailKes   Decimal  @db.Decimal(12, 2)
+  computedAt  DateTime @default(now())
+
+  @@index([productId, computedAt])
+  @@map("product_prices")
+}
+
+// ---------------------------------------------------------------------------
+// Catalog sync bookkeeping (Phase 1)
+// ---------------------------------------------------------------------------
+
+model CatalogSync {
+  id           String   @id @default(cuid())
+  source       String   @default("esimgo")
+  hash         String? // change-detection hash from the supplier
+  bundleCount  Int      @default(0)
+  status       String   @default("ok")
+  message      String?
+  startedAt    DateTime @default(now())
+  finishedAt   DateTime?
+
+  @@map("catalog_syncs")
+}
+
+// ---------------------------------------------------------------------------
+// Users & Auth (Phase 2)
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  CUSTOMER
+  PARTNER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  BLOCKED
+}
+
+model User {
+  id        String        @id @default(cuid())
+  phone     String?       @unique // E.164, e.g. +2547...
+  email     String?       @unique
+  name      String?
+  role      UserRole      @default(CUSTOMER)
+  status    UserStatus    @default(ACTIVE)
+  locale    String        @default("en")
+  sessions  Session[]
+  consents  UserConsent[]
+  orders    Order[]
+  esims     Esim[]
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@map("users")
+}
+
+// One-time passcodes for phone login. Codes are stored hashed, never plain.
+model OtpChallenge {
+  id        String    @id @default(cuid())
+  phone     String
+  codeHash  String
+  purpose   String    @default("login")
+  attempts  Int       @default(0)
+  expiresAt DateTime
+  consumedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([phone, createdAt])
+  @@map("otp_challenges")
+}
+
+// Refresh-token sessions (rotation + reuse detection). Token stored hashed.
+model Session {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  refreshHash String
+  userAgent   String?
+  ip          String?
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+model UserConsent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose   String // e.g. "terms", "privacy", "marketing"
+  granted   Boolean  @default(true)
+  version   String   @default("1.0")
+  grantedAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("user_consents")
+}
+
+// ---------------------------------------------------------------------------
+// Orders, Payments, eSIMs, Ledger (Phase 3 — the money path)
+// ---------------------------------------------------------------------------
+
+enum OrderStatus {
+  DRAFT
+  AWAITING_PAYMENT
+  PAID
+  PROVISIONING
+  PROVISIONED
+  COMPLETED
+  PAYMENT_FAILED
+  PROVISION_FAILED
+  REFUND_PENDING
+  REFUNDED
+  MANUAL_REVIEW
+  CANCELLED
+}
+
+enum PaymentMethod {
+  MPESA
+  CARD
+}
+
+enum PaymentState {
+  PENDING
+  PROCESSING
+  COMPLETE
+  FAILED
+  CANCELED
+}
+
+enum OrderKind {
+  PURCHASE
+  TOPUP
+}
+
+// Single-item order (MVP). Catalog products are not persisted, so we snapshot
+// every commercial field here so a later catalogue/price change never mutates
+// a placed order.
+model Order {
+  id             String      @id @default(cuid())
+  userId         String?
+  user           User?       @relation(fields: [userId], references: [id])
+  status         OrderStatus @default(DRAFT)
+  kind           OrderKind   @default(PURCHASE)
+  currency       String      @default("USD") // platform currency
+
+  productId        String // catalogue product id
+  providerPackageId String // Celitech package ref (provisioned by attributes below)
+  destinationIso   String // ISO-2 destination, used to provision via Celitech
+  title            String
+  dataMb           Int
+  validityDays     Int
+  quantity         Int       @default(1)
+  startDate        String?
+  endDate          String?
+  supplierDestination String?
+  supplierMode     String    @default("mock")
+  unlimited        Boolean   @default(false)
+  accessToken      String    @default(dbgenerated("(gen_random_uuid())::text"))
+  // For TOPUP orders: the ICCID of the existing eSIM to apply the bundle to.
+  targetIccid      String?
+
+  baseUsd        Decimal     @db.Decimal(10, 4)
+  fxRate         Decimal     @db.Decimal(12, 6)
+  unitPriceKes   Decimal     @db.Decimal(12, 2)
+  discountKes    Decimal     @db.Decimal(12, 2) @default(0)
+  totalKes       Decimal     @db.Decimal(12, 2)
+
+  customerPhone  String
+  customerEmail  String?
+  customerName   String?
+  compatAttested Boolean     @default(false)
+  attestedAt     DateTime?
+  partnerCode    String?
+  promoCode      String?
+
+  idempotencyKey String      @unique
+  requestHash    String?
+  failureReason  String?
+
+  payment        Payment?
+  esims          Esim[]
+  fulfilments    Fulfilment[]
+  commission     Commission?
+  ledgerEntries  LedgerEntry[]
+
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@index([userId, createdAt])
+  @@index([status])
+  @@map("orders")
+}
+
+// ---------------------------------------------------------------------------
+// Promotions, Partners, Support, Settings (Phase 5/6)
+// ---------------------------------------------------------------------------
+
+model Promotion {
+  id           String    @id @default(cuid())
+  code         String    @unique
+  kind         String    @default("PERCENT") // PERCENT | FIXED
+  value        Decimal   @db.Decimal(12, 2) // percent (0-100) or KES amount
+  minSpendKes  Decimal?  @db.Decimal(12, 2)
+  maxUses      Int?
+  usedCount    Int       @default(0)
+  validFrom    DateTime?
+  validTo      DateTime?
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+
+  @@map("promotions")
+}
+
+enum PartnerStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+}
+
+model Partner {
+  id            String        @id @default(cuid())
+  name          String
+  slug          String        @unique // referral code, used in /r/<slug>
+  email         String?
+  mpesaNumber   String?
+  commissionPct Decimal       @db.Decimal(5, 4) @default(0.15)
+  status        PartnerStatus @default(PENDING)
+  userId        String?       @unique // linked partner-portal login (role PARTNER)
+  commissions   Commission[]
+  payouts       Payout[]
+  createdAt     DateTime      @default(now())
+
+  @@map("partners")
+}
+
+model Commission {
+  id        String   @id @default(cuid())
+  partnerId String
+  partner   Partner  @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  orderId   String   @unique
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  amountKes Decimal  @db.Decimal(12, 2)
+  state     String   @default("ACCRUED") // ACCRUED | PAYABLE | PAID
+  payoutId  String?
+  payout    Payout?  @relation(fields: [payoutId], references: [id])
+  createdAt DateTime @default(now())
+
+  @@index([partnerId, state])
+  @@map("commissions")
+}
+
+model Payout {
+  id          String       @id @default(cuid())
+  partnerId   String
+  partner     Partner      @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  amountKes   Decimal      @db.Decimal(12, 2)
+  trackingId  String?
+  state       String       @default("pending") // pending | processing | completed | failed
+  commissions Commission[]
+  createdAt   DateTime     @default(now())
+
+  @@index([partnerId])
+  @@map("payouts")
+}
+
+model Ticket {
+  id          String   @id @default(cuid())
+  userId      String?
+  esimId      String?
+  category    String   @default("general")
+  message     String
+  status      String   @default("OPEN") // OPEN | RESOLVED
+  diagnostics Json?
+  reply       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([status, createdAt])
+  @@map("tickets")
+}
+
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}
+
+model Payment {
+  id         String        @id @default(cuid())
+  orderId    String        @unique
+  order      Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  provider   String        @default("paystack")
+  method     PaymentMethod @default(MPESA)
+  invoiceId  String        @unique
+  state      PaymentState  @default(PENDING)
+  amountKes  Decimal       @db.Decimal(12, 2)
+  feesKes    Decimal?      @db.Decimal(12, 2)
+  netKes     Decimal?      @db.Decimal(12, 2)
+  mpesaRef   String?
+  raw        Json?
+  verifiedAt DateTime?
+  expectedAmount Int?
+  chargeCurrency String @default("KES")
+  environment String @default("legacy")
+  checkoutUrl String?
+  emailSentAt DateTime?
+  emailAttemptAt DateTime?
+  refunds    Refund[]
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+
+  @@map("payments")
+}
+
+model Refund {
+  id          String   @id @default(cuid())
+  paymentId   String
+  payment     Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  amountKes   Decimal  @db.Decimal(12, 2)
+  reason      String
+  providerRef String?
+  state       String   @default("pending")
+  createdAt   DateTime @default(now())
+
+  @@index([paymentId])
+  @@map("refunds")
+}
+
+model Esim {
+  id            String   @id @default(cuid())
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id])
+  orderId       String
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  iccid         String   @unique
+  smdpAddress   String
+  matchingId    String
+  lpa           String // LPA:1$<smdp>$<matchingId>
+  providerPurchaseId String // Celitech purchase id — required for consumption polling
+  profileStatus String   @default("Released")
+  dataMb        Int
+  validityDays  Int
+
+  // Usage tracking (Phase 4). Bytes stored as BigInt; convert to Number in DTOs.
+  initialBytes      BigInt    @default(0)
+  remainingBytes    BigInt    @default(0)
+  usageUpdatedAt    DateTime?
+  expiresAt         DateTime?
+  alertedThresholds Int[]     @default([]) // e.g. [50, 80, 100]
+  expiryAlerted     Boolean   @default(false)
+  unlimited        Boolean   @default(false)
+  supplierMode     String    @default("mock")
+  packages         Fulfilment[]
+  emailSentAt      DateTime?
+  emailAttemptAt   DateTime?
+
+  snapshots     UsageSnapshot[]
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([userId])
+  @@index([orderId])
+  @@map("esims")
+}
+
+// Persist each billable attempt BEFORE contacting the supplier. Never automatically
+// resend an uncertain request. READY -> SENT -> COMPLETE or REVIEW.
+model Fulfilment {
+  id String @id @default(cuid())
+  orderId String
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  index Int
+  reference String @unique
+  state String @default("READY")
+  sentAt DateTime?
+  purchaseId String? @unique
+  esimId String?
+  esim Esim? @relation(fields: [esimId], references: [id])
+  remainingBytes BigInt @default(0)
+  initialBytes BigInt @default(0)
+  startsAt DateTime?
+  expiresAt DateTime?
+  error String?
+  updatedAt DateTime @default(now()) @updatedAt
+  @@unique([orderId, index])
+  @@index([state, updatedAt])
+  @@map("fulfilments")
+}
+
+model UsageSnapshot {
+  id             String   @id @default(cuid())
+  esimId         String
+  esim           Esim     @relation(fields: [esimId], references: [id], onDelete: Cascade)
+  remainingBytes BigInt
+  pctUsed        Int
+  source         String   @default("poll") // poll | webhook
+  capturedAt     DateTime @default(now())
+
+  @@index([esimId, capturedAt])
+  @@map("usage_snapshots")
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@map("push_subscriptions")
+}
+
+model NotificationLog {
+  id        String   @id @default(cuid())
+  userId    String?
+  channel   String // push | email | whatsapp | sms
+  template  String
+  payload   Json?
+  state     String   @default("sent")
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@map("notification_logs")
+}
+
+// Minimal double-entry ledger. Every money movement writes balanced entries.
+model LedgerEntry {
+  id        String   @id @default(cuid())
+  orderId   String?
+  order     Order?   @relation(fields: [orderId], references: [id])
+  account   String // customer_revenue | processor_fees | cogs | refunds (USD)
+  direction String // debit | credit
+  amountKes Decimal  @db.Decimal(12, 2)
+  memo      String?
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@index([account, createdAt])
+  @@map("ledger_entries")
+}
+
+// Idempotent inbound webhook log — second delivery of the same event is a no-op.
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  source      String // paystack | celitech
+  externalId  String
+  signatureOk Boolean  @default(false)
+  raw         Json
+  processedAt DateTime?
+  nextAttemptAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@unique([source, externalId])
+  @@index([source, processedAt, nextAttemptAt])
+  @@map("webhook_events")
+}
